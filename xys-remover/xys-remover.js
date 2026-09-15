@@ -10,14 +10,50 @@ const DECRYPTOR_MARKERS = ['CryptoJS', 'XMLHttpRequest', 'loadDataFile', '_0x', 
 const GUARD_MARKERS = ['customVariables', 'XYOU', 'SceneManager.exit', 'zijietiaodong'];
 const AD_EVENT_NAMES = [/XYOU/i, /游社/];
 const AD_EVENT_CONTENT = [/XYOU/i, /xyou/i, /zijietiaodong/i, /游社/];
+// Known standalone ad-injector plugin names. These are safe to delete outright
+// when no clean template matches.
+const AD_CORE_PLUGIN_NAMES = [/^ActorCommand$/i];
 
 const toolDir = __dirname;
 const CLEAN_ACTOR_COMMAND = path.join(toolDir, 'ActorCommand.clean.js');
 
+let _pluginsRef = null;
+let _backupDir = null;
+const _backedUp = new Set();
+
 function log(msg) { process.stdout.write(msg + '\n'); }
+
+// Creates the backup directory lazily and copies a file into it before it is
+// modified or deleted. Safe to call multiple times for the same file.
+function backupBefore(gameDir, relPath) {
+    if (_backedUp.has(relPath)) return;
+    const src = path.join(gameDir, relPath);
+    if (!fs.existsSync(src)) { _backedUp.add(relPath); return; }
+    if (!_backupDir) {
+        _backupDir = path.join(gameDir, '_backup_xyou_' + new Date().toISOString().replace(/[:.]/g, '-'));
+        fs.mkdirSync(_backupDir, { recursive: true });
+    }
+    const dst = path.join(_backupDir, relPath);
+    fs.mkdirSync(path.dirname(dst), { recursive: true });
+    fs.copyFileSync(src, dst);
+    _backedUp.add(relPath);
+}
 
 function readUtf8(p) { return fs.readFileSync(p, 'utf8'); }
 function writeUtf8(p, content) { fs.writeFileSync(p, content, 'utf8'); }
+
+function serializePlugins(plugins) {
+    return 'var $plugins = ' + JSON.stringify(plugins, null, 2) + ';\n';
+}
+
+// Rewrites js/plugins.js as a clean, plain $plugins assignment built from the
+// parsed plugin list. Used when the original plugins.js is obfuscated/dynamic
+// (e.g. plugin names are built at runtime), which makes in-place edits impossible.
+function rewritePluginsFile(gameDir) {
+    if (!_pluginsRef) return false;
+    writeUtf8(path.join(gameDir, 'js', 'plugins.js'), serializePlugins(_pluginsRef));
+    return true;
+}
 
 function walkEvents(root, cb) {
     if (!root || typeof root !== 'object') return;
@@ -204,6 +240,7 @@ function parsePluginsList(gameDir) {
     vm.createContext(sb);
     try {
         vm.runInContext(readUtf8(pluginsJs), sb, { filename: 'plugins.js' });
+        _pluginsRef = sb.$plugins;
         return sb.$plugins;
     } catch (e) {
         log('  ! 无法解析 plugins.js: ' + e.message);
@@ -318,7 +355,10 @@ function scanMaps(gameDir, report, dryRun) {
             }
         }
         if (modified) {
-            if (!dryRun) writeUtf8(fp, JSON.stringify(map));
+            if (!dryRun) {
+                backupBefore(gameDir, 'data/' + m);
+                writeUtf8(fp, JSON.stringify(map));
+            }
             changed.push('data/' + m);
         }
     }
@@ -328,6 +368,7 @@ function scanMaps(gameDir, report, dryRun) {
 function scanPluginsForAdCore(gameDir, plugins, report, dryRun) {
     const cleanTemplate = fs.existsSync(CLEAN_ACTOR_COMMAND) ? readUtf8(CLEAN_ACTOR_COMMAND) : null;
     const changed = [];
+    let pluginsJsChanged = false;
     for (const p of plugins || []) {
         if (!p.status) continue;
         const fp = pluginFilePath(gameDir, p.name);
@@ -335,14 +376,40 @@ function scanPluginsForAdCore(gameDir, plugins, report, dryRun) {
         const code = readUtf8(fp);
         if (!AD_KEYWORDS.some(k => code.includes(k))) continue;
         report.push('  发现广告插件: ' + p.name + '.js');
-        if (cleanTemplate && code.includes('showNewGameMessage') && code.includes('customButtons') && code.includes('buttonScale')) {
-            if (!dryRun) writeUtf8(fp, cleanTemplate);
+        const hasCleanMatch = cleanTemplate
+            && code.includes('showNewGameMessage')
+            && code.includes('customButtons')
+            && code.includes('buttonScale');
+        if (hasCleanMatch) {
+            if (!dryRun) {
+                backupBefore(gameDir, 'js/plugins/' + p.name + '.js');
+                writeUtf8(fp, cleanTemplate);
+            }
             report.push('    已替换为干净版本 (ActorCommand 模板)');
             changed.push('js/plugins/' + p.name + '.js');
+            continue;
+        }
+        // No clean template match. Decide whether this file is a standalone ad
+        // injector that is safe to remove entirely. A genuine RPG Maker plugin
+        // always carries a "/*:" header; ad injectors are headerless blobs that
+        // hook the engine globally. Known ad-core plugin names are also flagged.
+        const hasHeader = /\/\*:/.test(code);
+        const isAdCore = AD_CORE_PLUGIN_NAMES.some(r => r.test(p.name)) || !hasHeader;
+        if (isAdCore) {
+            report.push('    识别为独立广告注入插件 (无插件头/已知广告核心), 将禁用并删除');
+            if (!dryRun) {
+                backupBefore(gameDir, 'js/plugins/' + p.name + '.js');
+                backupBefore(gameDir, 'js/plugins.js');
+                p.status = false;
+                if (rewritePluginsFile(gameDir)) pluginsJsChanged = true;
+                try { fs.unlinkSync(fp); } catch (e) {}
+                changed.push('js/plugins/' + p.name + '.js');
+            }
         } else {
             report.push('    警告: 无匹配的干净模板, 未自动处理, 请手动处理该插件');
         }
     }
+    if (pluginsJsChanged) changed.push('js/plugins.js');
     return changed;
 }
 
@@ -351,10 +418,26 @@ function setPluginStatus(gameDir, name, status, report) {
     const text = readUtf8(fp);
     const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const re = new RegExp('(\\{"name":"' + escaped + '","status"):true');
-    if (!re.test(text)) return false;
-    writeUtf8(fp, text.replace(re, '$1:' + status));
-    report.push('  插件 ' + name + '.js 已在 plugins.js 中禁用');
-    return true;
+    if (re.test(text)) {
+        backupBefore(gameDir, 'js/plugins.js');
+        writeUtf8(fp, text.replace(re, '$1:' + status));
+        report.push('  插件 ' + name + '.js 已在 plugins.js 中禁用');
+        return true;
+    }
+    // In-place edit failed (obfuscated/dynamic plugins.js). Fall back to rewriting
+    // the whole file from the parsed $plugins list.
+    if (_pluginsRef) {
+        const entry = _pluginsRef.find(p => p && p.name === name);
+        if (entry) {
+            backupBefore(gameDir, 'js/plugins.js');
+            entry.status = status;
+            if (rewritePluginsFile(gameDir)) {
+                report.push('  插件 ' + name + '.js 已在 plugins.js 中禁用 (已重建 plugins.js)');
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 function backupFiles(gameDir, files) {
@@ -370,16 +453,20 @@ function backupFiles(gameDir, files) {
 }
 
 function residualScan(gameDir) {
-    const excludes = [/[\\/]_backup_xyou[^\\/]*[\\/]/, /[\\/]tool[\\/]/];
+    const selfDir = path.dirname(path.resolve(__filename));
+    const excludes = [/[\\/]_backup_xyou[^\\/]*[\\/]/, /[\\/]tool[\\/]/, /[\\/]xys-remover[\\/]/];
     const found = [];
     const walk = (dir) => {
         for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
             const fp = path.join(dir, entry.name);
             if (entry.isDirectory()) {
-                if (excludes.some(r => r.test(fp))) continue;
+                if (excludes.some(r => r.test(fp)) || path.resolve(fp) === selfDir) continue;
                 walk(fp);
-            } else if (entry.isFile() && /\.(js|json|html|css)$/i.test(entry.name) && entry.size < 20 * 1024 * 1024) {
+            } else if (entry.isFile() && /\.(js|json|html|css)$/i.test(entry.name)) {
                 try {
+                    if (path.resolve(fp) === path.resolve(__filename)) continue;
+                    const st = fs.statSync(fp);
+                    if (st.size >= 20 * 1024 * 1024) continue;
                     const content = readUtf8(fp);
                     if (AD_KEYWORDS.some(k => content.includes(k))) found.push(fp);
                 } catch (e) {}
@@ -449,6 +536,7 @@ async function main() {
                     events[i] = null;
                 }
                 if (!dryRun) {
+                    backupBefore(gameDir, 'data/CommonEvents.json');
                     writeUtf8(ceFile, JSON.stringify(events));
                     changedFiles.push('data/CommonEvents.json');
                 }
@@ -462,6 +550,7 @@ async function main() {
 
         if (decryptor) {
             if (!dryRun) {
+                backupBefore(gameDir, 'js/plugins/' + decryptor.name + '.js');
                 fs.unlinkSync(decryptor.fp);
                 changedFiles.push('js/plugins/' + decryptor.name + '.js');
                 if (setPluginStatus(gameDir, decryptor.name, false, report)) {
@@ -505,9 +594,12 @@ async function main() {
     for (const r of report) log(r);
 
     if (!dryRun && changedFiles.length) {
-        const backupDir = backupFiles(gameDir, changedFiles);
         log('');
-        log('已修改 ' + changedFiles.length + ' 个文件, 备份于: ' + backupDir);
+        if (_backupDir) {
+            log('已修改 ' + changedFiles.length + ' 个文件, 备份于: ' + _backupDir);
+        } else {
+            log('已修改 ' + changedFiles.length + ' 个文件 (无文件需要备份)');
+        }
     }
     log('');
     log('完成。');
