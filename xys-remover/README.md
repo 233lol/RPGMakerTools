@@ -31,7 +31,7 @@ node xys-remover.js . --dry-run
 | 组件 | 检测特征 | 处理方式 |
 |---|---|---|
 | 数据解密插件 (UTA_Commone 类) | 插件代码中包含 `_0x`/`CryptoJS`/`CommonEvents` 且运行时替换 `DataManager.loadDataFile` | 沙盒运行插件自动解密 CommonEvents.json, 移除广告事件后写回明文; 删除插件文件并在 plugins.js 中禁用 |
-| 广告核心插件 (ActorCommand 类) | 代码包含 `XYOU` / `zijietiaodong` / `api/v1/config` | 若插件参数头与 `tool/ActorCommand.clean.js` 模板一致则整体替换为干净版 |
+| 广告核心插件 (ActorCommand 类) | 代码包含 `XYOU` / `zijietiaodong` / `api/v1/config`; 代码被混淆时改为**解码隐藏字符串表**后再匹配 | 若识别出 ActorCommand 系特征则整体替换为干净模板 `ActorCommand.clean.js`, 否则禁用并在 plugins.js 中停用 |
 | 公共事件 (CE#999 等) | 事件名或脚本含 `XYOU` / `游社` | 置为 null |
 | 地图防篡改脚本 | 脚本含 `_0x` + `customVariables` / `SceneManager.exit` | 替换为空脚本 `0;` |
 
@@ -41,6 +41,7 @@ node xys-remover.js . --dry-run
 - `--dry-run` 只报告不写入
 - 未匹配到干净模板的广告插件不会被自动删除 (仅警告), 需手动处理
 - 工具自身及备份目录不会出现在残留扫描结果中
+- **混淆代码**: 被 javascript-obfuscator 混淆的插件 (如 `AAActorCommand.js`) 在明文里搜不到任何关键词, 工具会先在沙盒中执行该文件、还原其隐藏字符串表, 再用同一套关键词匹配; 残留扫描同样会对 ≤3MB 的混淆文件做解码检查
 
 ## 文件结构
 
@@ -57,4 +58,10 @@ tool/
 
 ```
 XYOU  xyou  zijietiaodong  KEYSWITCH  INSERTA  游社
+```
+
+注意: 关键词被写进混淆文件时纯文本搜索搜不到, 最可靠的验证方式是再跑一次预览模式, 它的残留扫描会解码混淆文件:
+
+```bash
+node xys-remover.js . --dry-run
 ```

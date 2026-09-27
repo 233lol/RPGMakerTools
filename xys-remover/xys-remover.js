@@ -12,7 +12,11 @@ const AD_EVENT_NAMES = [/XYOU/i, /游社/];
 const AD_EVENT_CONTENT = [/XYOU/i, /xyou/i, /zijietiaodong/i, /游社/];
 // Known standalone ad-injector plugin names. These are safe to delete outright
 // when no clean template matches.
-const AD_CORE_PLUGIN_NAMES = [/^ActorCommand$/i];
+const AD_CORE_PLUGIN_NAMES = [/^ActorCommand$/i, /^AAActorCommand$/i];
+// Identifiers that prove a plugin belongs to the ActorCommand family even when
+// the file has been obfuscated (comments/param header are stripped by the
+// obfuscator, so the raw `/*:` header test is not reliable any more).
+const ACTOR_COMMAND_MARKERS = ['mainKeyDiv', 'MAINKEYDIV', 'showNewGameMessage', 'customButtons', 'buttonScale'];
 
 const toolDir = __dirname;
 const CLEAN_ACTOR_COMMAND = path.join(toolDir, 'ActorCommand.clean.js');
@@ -41,6 +45,97 @@ function backupBefore(gameDir, relPath) {
 
 function readUtf8(p) { return fs.readFileSync(p, 'utf8'); }
 function writeUtf8(p, content) { fs.writeFileSync(p, content, 'utf8'); }
+
+// ---------------------------------------------------------------------------
+// Obfuscated plugin support
+// ---------------------------------------------------------------------------
+// Cracked releases often run plugins through javascript-obfuscator, which
+// hides every keyword (XYOU / 游社 / xyou.vip ...) inside a shuffled string
+// array, so a plain text scan reports "nothing found" while the ad is still
+// very much alive. This helper executes such a file in a throw-away sandbox
+// and asks every `_0x...` helper function for its table of strings, giving us
+// the plaintext back without needing a real de-obfuscator.
+function makeLooseSandbox() {
+    const target = {};
+    const makeStub = (name) => new Proxy(function () {}, {
+        get(t, p) {
+            if (p in t) return t[p];
+            if (p === Symbol.toPrimitive) return () => 0;
+            if (p === 'toString') return () => 'stub:' + name;
+            if (p === 'then') return undefined;
+            if (p === 'constructor') return Function;
+            if (p === 'length') return 0;
+            return makeStub(name + '.' + String(p));
+        },
+        set(t, p, v) { t[p] = v; return true; },
+        apply() { return makeStub(name); },
+        construct() { return makeStub(name); },
+    });
+    const sandbox = new Proxy(target, {
+        get(t, p) {
+            if (p in t) return t[p];
+            if (p === Symbol.toPrimitive) return () => 0;
+            if (typeof p === 'symbol') return undefined;
+            if (p === 'console') return { log() {}, warn() {}, error() {}, info() {}, debug() {} };
+            if (p === 'globalThis' || p === 'window' || p === 'self' || p === 'global') return sandbox;
+            if (p === 'undefined') return undefined;
+            if (p === 'require') return () => makeStub('require');
+            if (p === 'process') return { platform: process.platform, versions: { node: process.versions.node }, exit() {} };
+            if (p === 'setTimeout' || p === 'setInterval') return () => 0;
+            if (p === 'clearTimeout' || p === 'clearInterval') return () => {};
+            if (['Math', 'JSON', 'Date', 'parseInt', 'parseFloat', 'isNaN', 'isFinite', 'String', 'Number',
+                'Array', 'Object', 'Boolean', 'RegExp', 'Error', 'TypeError', 'Function', 'Proxy', 'Symbol',
+                'Infinity', 'NaN', 'encodeURIComponent', 'decodeURIComponent'].includes(String(p))) return global[p];
+            const st = makeStub(String(p));
+            t[p] = st;
+            return st;
+        },
+        set(t, p, v) { t[p] = v; return true; },
+        has() { return true; },
+    });
+    return { sandbox, target };
+}
+
+function looksObfuscated(code) {
+    return /_0x[0-9a-fA-F]{4,}/.test(code);
+}
+
+// Returns the plaintext strings hidden in an obfuscated file ([] when the file
+// is plain text or when nothing could be decoded).
+function decodeHiddenStrings(code, tag) {
+    if (!looksObfuscated(code)) return [];
+    const { sandbox, target } = makeLooseSandbox();
+    const ctx = vm.createContext(sandbox);
+    try {
+        vm.runInContext(code, ctx, { filename: tag || 'obfuscated.js', timeout: 20000 });
+    } catch (e) { /* anti-debug loops / missing globals are fine, tables are usually defined first */ }
+    const found = new Set();
+    for (const key of Object.getOwnPropertyNames(target)) {
+        if (!/^_0x/.test(key)) continue;
+        const fn = target[key];
+        if (typeof fn !== 'function') continue;
+        let miss = 0;
+        for (let i = 0; i < 30000 && miss < 1500; i++) {
+            let v;
+            try { v = fn(i); } catch (e) { break; }
+            if (typeof v === 'string' && v.length > 0) { found.add(v); miss = 0; }
+            else miss++;
+        }
+    }
+    return Array.from(found);
+}
+
+// Finds ad keywords in raw source first, then in the decoded string table.
+function findAdKeywords(code, hidden) {
+    const lower = (s) => s.toLowerCase();
+    const hits = [];
+    for (const k of AD_KEYWORDS) {
+        if (code.includes(k)) { hits.push(k + ' (明文)'); continue; }
+        if (hidden.some(s => lower(s).includes(lower(k)))) hits.push(k + ' (混淆串)');
+    }
+    return hits;
+}
+
 
 function serializePlugins(plugins) {
     return 'var $plugins = ' + JSON.stringify(plugins, null, 2) + ';\n';
@@ -374,12 +469,20 @@ function scanPluginsForAdCore(gameDir, plugins, report, dryRun) {
         const fp = pluginFilePath(gameDir, p.name);
         if (!fs.existsSync(fp)) continue;
         const code = readUtf8(fp);
-        if (!AD_KEYWORDS.some(k => code.includes(k))) continue;
-        report.push('  发现广告插件: ' + p.name + '.js');
+        // Ad keywords are usually plain text, but cracked builds obfuscate the
+        // whole plugin, so fall back to decoding the hidden string table.
+        const hidden = decodeHiddenStrings(code, p.name + '.js');
+        const adHits = findAdKeywords(code, hidden);
+        if (!adHits.length) continue;
+        const hay = code + '\n' + hidden.join('\n');
+        report.push('  发现广告插件: ' + p.name + '.js' +
+            (hidden.length ? ' (混淆代码, 已解码 ' + hidden.length + ' 条字符串)' : ''));
+        report.push('    命中特征: ' + adHits.join(', '));
         const hasCleanMatch = cleanTemplate
-            && code.includes('showNewGameMessage')
-            && code.includes('customButtons')
-            && code.includes('buttonScale');
+            && (code.includes('showNewGameMessage')
+                && code.includes('customButtons')
+                && code.includes('buttonScale')
+                || ACTOR_COMMAND_MARKERS.some(k => hay.includes(k)));
         if (hasCleanMatch) {
             if (!dryRun) {
                 backupBefore(gameDir, 'js/plugins/' + p.name + '.js');
@@ -392,7 +495,8 @@ function scanPluginsForAdCore(gameDir, plugins, report, dryRun) {
         // No clean template match. Decide whether this file is a standalone ad
         // injector that is safe to remove entirely. A genuine RPG Maker plugin
         // always carries a "/*:" header; ad injectors are headerless blobs that
-        // hook the engine globally. Known ad-core plugin names are also flagged.
+        // hook the engine globally (obfuscation strips the header too). Known
+        // ad-core plugin names are also flagged.
         const hasHeader = /\/\*:/.test(code);
         const isAdCore = AD_CORE_PLUGIN_NAMES.some(r => r.test(p.name)) || !hasHeader;
         if (isAdCore) {
@@ -468,7 +572,13 @@ function residualScan(gameDir) {
                     const st = fs.statSync(fp);
                     if (st.size >= 20 * 1024 * 1024) continue;
                     const content = readUtf8(fp);
-                    if (AD_KEYWORDS.some(k => content.includes(k))) found.push(fp);
+                    if (AD_KEYWORDS.some(k => content.includes(k))) {
+                        found.push(fp);
+                    } else if (looksObfuscated(content) && st.size <= 3 * 1024 * 1024) {
+                        // Plain scan is blind to obfuscated files, decode and re-check.
+                        const hidden = decodeHiddenStrings(content, entry.name);
+                        if (findAdKeywords('', hidden).length) found.push(fp + '  (混淆字符串中)');
+                    }
                 } catch (e) {}
             }
         }
